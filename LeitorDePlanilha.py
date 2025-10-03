@@ -7,21 +7,15 @@ from reportlab.platypus import Paragraph, Spacer, Image, Table, TableStyle, Page
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
+from reportlab.lib.units import mm
 from datetime import datetime, timedelta
-import os, sys
+from pathlib import Path
 from PIL import Image as PILImage
+import os, sys
 
 COR = "#FF6600"
 
-def get_path(rel):
-    base = getattr(sys, "frozen", False) and sys._MEIPASS or os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base, rel)
-
-def ultima_semana_sexta_a_sexta(df):
-    ultima = df["Data"].max()
-    ultima_sexta = ultima - timedelta(days=(ultima.weekday() - 4) % 7)
-    inicio = ultima_sexta - timedelta(days=6)
-    return inicio, ultima_sexta
+REQUIRED_COLS = {"Data", "Aluno", "Inscrito", "Experimental", "Plano", "Pagamento"}
 
 def safe_mode(s):
     try:
@@ -29,141 +23,192 @@ def safe_mode(s):
     except Exception:
         return "N/A"
 
-def gerar_relatorio():
-    arq = entry_arquivo.get()
-    if not arq:
-        messagebox.showwarning("Erro", "Selecione a planilha")
-        return
-    try:
-        df = pd.read_excel(arq)
-        df["Data"] = pd.to_datetime(df["Data"])
+def ultima_semana_sexta_a_sexta(df):
+    ultima = df["Data"].max()
+    ultima_sexta = ultima - timedelta(days=(ultima.weekday() - 4) % 7)
+    inicio = ultima_sexta - timedelta(days=6)
+    return inicio, ultima_sexta
 
+def gerar_relatorio():
+    arquivo = entry_arquivo.get().strip()
+    if not arquivo:
+        messagebox.showwarning("Erro", "Selecione a planilha (.xlsx).")
+        return
+
+    try:
+        # --------- Ler arquivo selecionado (sempre) ----------
+        df = pd.read_excel(arquivo)
+        if df.empty:
+            messagebox.showwarning("Erro", "Planilha vazia.")
+            return
+        # valida colunas
+        faltantes = REQUIRED_COLS - set(df.columns)
+        if faltantes:
+            messagebox.showerror("Erro", f"Colunas faltando na planilha: {', '.join(faltantes)}")
+            return
+
+        df["Data"] = pd.to_datetime(df["Data"], errors="coerce")
+        if df["Data"].isna().all():
+            messagebox.showerror("Erro", "Coluna 'Data' não contém datas válidas.")
+            return
+
+        # --------- escolher período ----------
         periodo = var_periodo.get()
         if periodo == "Mensal":
-            m = df["Data"].dt.month.max(); y = df["Data"].dt.year.max()
-            dfp = df[(df["Data"].dt.month==m) & (df["Data"].dt.year==y)].copy()
-            titulo = f"{m}/{y}"; slug = f"{m}_{y}"
-        else:
+            m = df["Data"].dt.month.max()
+            y = df["Data"].dt.year.max()
+            dfp = df[(df["Data"].dt.month == m) & (df["Data"].dt.year == y)].copy()
+            titulo = f"{m:02d}/{y}"
+            slug = f"{y}{m:02d}"
+        else:  # semanal sexta->sexta com base na última data do arquivo atual
             inicio, fim = ultima_semana_sexta_a_sexta(df)
-            dfp = df[(df["Data"]>=inicio) & (df["Data"]<=fim)].copy()
+            dfp = df[(df["Data"] >= inicio) & (df["Data"] <= fim)].copy()
             titulo = f"Semana de {inicio.strftime('%d/%m')} a {fim.strftime('%d/%m/%Y')}"
             slug = f"{inicio.strftime('%Y%m%d')}_{fim.strftime('%Y%m%d')}"
 
         if dfp.empty:
-            messagebox.showwarning("Aviso", "Período sem dados.")
+            messagebox.showwarning("Aviso", "Período selecionado não contém dados.")
             return
 
+        # --------- métricas ----------
         dfp["Dia"] = dfp["Data"].dt.day
-        matriculados = int(dfp[dfp["Inscrito"]==1].shape[0])
-        experimentais = int(dfp["Experimental"].sum())
-        exp_conv = int(dfp[(dfp["Experimental"]==1) & (dfp["Inscrito"]==1)].shape[0])
-        media_ins = dfp.groupby("Dia")["Inscrito"].sum().mean()
-        pagamento_pred = safe_mode(dfp[dfp["Inscrito"]==1]["Pagamento"])
-        plano_pred = safe_mode(dfp[dfp["Inscrito"]==1]["Plano"])
+        total_matriculados = int(dfp[dfp["Inscrito"] == 1].shape[0])
+        total_experimentais = int(dfp["Experimental"].sum())
+        exp_com_conv = int(dfp[(dfp["Experimental"] == 1) & (dfp["Inscrito"] == 1)].shape[0])
+        media_diaria = dfp.groupby("Dia")["Inscrito"].sum().mean()
+        pagamento_pred = safe_mode(dfp[dfp["Inscrito"] == 1]["Pagamento"])
+        plano_pred = safe_mode(dfp[dfp["Inscrito"] == 1]["Plano"])
         try:
             renov = int(entry_renov.get() or 0)
         except Exception:
             renov = 0
 
-        os.makedirs(get_path("graficos"), exist_ok=True)
-        os.makedirs(get_path("Relatorios"), exist_ok=True)
+        # --------- criar pastas: Desktop/Relatorios/<slug>/Graficos ----------
+        base = Path.home() / "Desktop" / "Relatorios" / slug
+        graf_dir = base / "Graficos"
+        base.mkdir(parents=True, exist_ok=True)
+        graf_dir.mkdir(parents=True, exist_ok=True)
 
+        # --------- gráficos com nomes únicos (por slug) ----------
+        graf_inscr = graf_dir / f"inscritos_dia_{slug}.png"
         inscritos_dia = dfp.groupby("Dia")["Inscrito"].sum().astype(int)
-        plt.figure(figsize=(7,2.6))
+        plt.figure(figsize=(7, 2.6))
         ax = inscritos_dia.plot(kind="bar", color=COR)
         ax.yaxis.set_major_locator(MaxNLocator(integer=True))
         plt.xlabel("Dia"); plt.ylabel("Inscritos"); plt.tight_layout()
-        plt.savefig(get_path("graficos/inscritos_dia.png"), bbox_inches="tight"); plt.close()
+        plt.savefig(str(graf_inscr), bbox_inches="tight"); plt.close()
 
+        graf_pag = graf_dir / f"pagamento_{slug}.png"
         pagamento = dfp.groupby("Pagamento")["Inscrito"].sum()
-        plt.figure(figsize=(3.2,3.2))
+        plt.figure(figsize=(3.2, 3.2))
         pagamento.plot(kind="pie", autopct='%1.1f%%', startangle=140,
-                       colors=[COR,"#FFA500","#FFB266","#FFCC99"])
+                       colors=[COR, "#FFA500", "#FFB266", "#FFCC99"])
         plt.ylabel(""); plt.tight_layout()
-        plt.savefig(get_path("graficos/pagamento.png"), bbox_inches="tight"); plt.close()
+        plt.savefig(str(graf_pag), bbox_inches="tight"); plt.close()
+
+        # --------- PDF ----------
+        pdf_path = base / f"relatorio_{slug}.pdf"
+        pdf_path_str = str(pdf_path)
 
         def rodape(canvas, doc):
-            if doc.page == 2:
-                canvas.saveState()
-                txt = f"{datetime.now().strftime('%d/%m/%Y %H:%M')} - Raquel Camille da Silva"
-                canvas.setFont("Helvetica", 8)
-                canvas.drawRightString(A4[0]-40, 20, txt)
-                canvas.restoreState()
+            canvas.saveState()
+            txt = f"{datetime.now().strftime('%d/%m/%Y %H:%M')} - Raquel Camille da Silva"
+            canvas.setFont("Helvetica", 8)
+            canvas.drawRightString(A4[0] - 20 * mm, 10 * mm, txt)
+            canvas.restoreState()
 
-        pdf_path = get_path(f"Relatorios/relatorio_{slug}.pdf")
-        doc = BaseDocTemplate(pdf_path, pagesize=A4)
+        doc = BaseDocTemplate(pdf_path_str, pagesize=A4)
         frame = Frame(doc.leftMargin, doc.bottomMargin, doc.width, doc.height, id="f")
         doc.addPageTemplates([PageTemplate(id="p", frames=frame, onPage=rodape)])
 
         styles = getSampleStyleSheet()
-        title_s = ParagraphStyle("title", parent=styles["Title"], alignment=1, textColor=colors.HexColor(COR))
-        h_s = ParagraphStyle("h", parent=styles["Heading2"], textColor=colors.HexColor(COR))
+        title_style = ParagraphStyle("title", parent=styles["Title"], alignment=1, textColor=colors.HexColor(COR))
+        hstyle = ParagraphStyle("h", parent=styles["Heading2"], textColor=colors.HexColor(COR))
         normal = styles["Normal"]
 
         story = []
-        story.append(Paragraph(f"Relatório ({titulo})", title_s))
+        story.append(Paragraph(f"Relatório ({titulo})", title_style))
         story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor(COR)))
-        story.append(Spacer(1,10))
+        story.append(Spacer(1, 8))
 
-        resumo = (f"No período {titulo}, tivemos <b>{matriculados} alunos que assinaram o plano</b>. "
-                  f"Foram realizadas <b>{experimentais} aulas experimentais</b>, das quais <b>{exp_conv} resultaram em matrícula</b>. "
-                  f"A forma de pagamento predominante foi <b>{pagamento_pred}</b> e o plano mais escolhido foi <b>{plano_pred}</b>.")
-        story.append(Paragraph("Resumo", h_s)); story.append(Paragraph(resumo, normal)); story.append(Spacer(1,8))
+        resumo = (
+            f"No período {titulo}, tivemos <b>{total_matriculados} alunos que assinaram o plano</b>. "
+            f"Foram realizadas <b>{total_experimentais} aulas experimentais</b>, das quais <b>{exp_com_conv} resultaram em matrícula</b>. "
+            f"Renovações (manual): <b>{renov}</b>. Forma de pagamento predominante: <b>{pagamento_pred}</b>. Plano mais escolhido: <b>{plano_pred}</b>."
+        )
+        story.append(Paragraph("Resumo do Período", hstyle))
+        story.append(Paragraph(resumo, normal))
+        story.append(Spacer(1, 8))
 
-        story.append(Paragraph("Métricas Principais", h_s))
-        for txt in [
-            f"Total de alunos matriculados: {matriculados}",
-            f"Aulas experimentais realizadas: {experimentais}",
-            f"Aulas experimentais com conversão: {exp_conv}",
-            f"Renovações de contratos: {renov}",
-            f"Média diária de inscritos: {media_ins:.0f}",
-            f"Forma de pagamento predominante: {pagamento_pred}",
-            f"Plano mais escolhido: {plano_pred}"
+        story.append(Paragraph("Métricas Principais", hstyle))
+        for linha in [
+            f"Total de alunos matriculados: {total_matriculados}",
+            f"Aulas experimentais realizadas: {total_experimentais}",
+            f"Aulas experimentais com conversão: {exp_com_conv}",
+            f"Renovações de contratos (manual): {renov}",
+            f"Média diária de inscritos: {media_diaria:.0f}"
         ]:
-            story.append(Paragraph(txt, normal))
-        story.append(Spacer(1,8))
+            story.append(Paragraph(linha, normal))
+        story.append(Spacer(1, 8))
 
-        def add_img(path, titulo, w=360):
-            img = PILImage.open(path); r = img.height / img.width
-            story.append(Paragraph(titulo, h_s))
-            story.append(Image(path, width=w, height=w * r))
-            story.append(Spacer(1,6))
+        def add_img(path_obj, titulo, width=360):
+            path_s = str(path_obj)
+            img = PILImage.open(path_s)
+            ratio = img.height / img.width
+            story.append(Paragraph(titulo, hstyle))
+            story.append(Image(path_s, width=width, height=width * ratio))
+            story.append(Spacer(1, 6))
 
-        add_img(get_path("graficos/inscritos_dia.png"), "Inscrições por Dia", w=360)
-        add_img(get_path("graficos/pagamento.png"), "Distribuição por Pagamento", w=170)
+        add_img(graf_inscr, "Inscrições por Dia", width=360)
+        add_img(graf_pag, "Distribuição por Pagamento", width=170)
 
         story.append(PageBreak())
-        story.append(Paragraph("Lista de novos alunos", ParagraphStyle("c", parent=h_s, alignment=1)))
-        tabela = dfp[dfp["Inscrito"]==1][["Aluno","Plano","Pagamento"]]
+        story.append(Paragraph("Lista de novos alunos", ParagraphStyle("c", parent=hstyle, alignment=1)))
+        tabela = dfp[dfp["Inscrito"] == 1][["Aluno", "Plano", "Pagamento"]]
         dados = [tabela.columns.tolist()] + tabela.values.tolist()
-        t = Table(dados, hAlign="CENTER")
-        t.setStyle(TableStyle([
-            ("GRID",(0,0),(-1,-1),0.5,colors.HexColor(COR)),
-            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#FFCC99")),
-            ("ALIGN",(0,1),(-1,-1),"CENTER")
+        tabela_report = Table(dados, hAlign="CENTER")
+        tabela_report.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor(COR)),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#FFCC99")),
+            ("ALIGN", (0, 1), (-1, -1), "CENTER"),
         ]))
-        story.append(t)
+        story.append(tabela_report)
 
         doc.build(story)
-        messagebox.showinfo("Sucesso", f"Relatório gerado: {pdf_path}")
 
-    except Exception as e:
-        messagebox.showerror("Erro", str(e))
+        messagebox.showinfo("Sucesso", f"Relatório gerado:\n{pdf_path_str}")
 
-# Interface
-root = tk.Tk(); root.title("Gerador de Relatório"); root.geometry("520x260")
+    except Exception as ex:
+        messagebox.showerror("Erro", str(ex))
+
+
+# ---------- Interface ----------
+root = tk.Tk()
+root.title("Gerador de Relatório")
+root.geometry("560x300")
+
 tk.Label(root, text="Planilha (.xlsx):").pack(pady=6)
-entry_arquivo = tk.Entry(root, width=66); entry_arquivo.pack()
+entry_arquivo = tk.Entry(root, width=72)
+entry_arquivo.pack()
+
 def selecionar_arquivo():
-    f = filedialog.askopenfilename(filetypes=[("Excel","*.xlsx")])
+    f = filedialog.askopenfilename(filetypes=[("Planilha Excel", "*.xlsx;*.xls")])
     if f:
-        entry_arquivo.delete(0, tk.END); entry_arquivo.insert(0, f)
+        entry_arquivo.delete(0, tk.END)
+        entry_arquivo.insert(0, f)
+
 tk.Button(root, text="Selecionar arquivo", command=selecionar_arquivo).pack(pady=6)
+
 tk.Label(root, text="Período:").pack()
 var_periodo = tk.StringVar(value="Mensal")
 tk.Radiobutton(root, text="Mensal", variable=var_periodo, value="Mensal").pack()
 tk.Radiobutton(root, text="Semanal (sexta a sexta)", variable=var_periodo, value="Semanal").pack()
+
 tk.Label(root, text="Renovações (manual):").pack(pady=4)
-entry_renov = tk.Entry(root, width=10); entry_renov.insert(0,"0"); entry_renov.pack()
+entry_renov = tk.Entry(root, width=10)
+entry_renov.insert(0, "0")
+entry_renov.pack()
+
 tk.Button(root, text="Gerar Relatório", width=20, command=gerar_relatorio).pack(pady=12)
+
 root.mainloop()
